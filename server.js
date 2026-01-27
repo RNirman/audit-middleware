@@ -7,80 +7,76 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto'); // Built-in Node.js cryptography library
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// --- 1. MOCK USER DATABASE ---
-// In a real system, this would be a MongoDB or SQL table.
-// We map these application users to the Blockchain Identity "appUser"
+// --- CONSTANTS ---
+const ENCRYPTION_KEY = crypto.createHash('sha256').update(String(process.env.FILE_ENCRYPTION_KEY)).digest('base64').substr(0, 32);
+const ALGORITHM = 'aes-256-cbc';
+
+// --- MOCK USER DB (Same as before) ---
 const USERS = [
     { username: "sme01", password: "123", role: "SME", name: "Alpha Industries" },
     { username: "auditor01", password: "123", role: "AUDITOR", name: "Big 4 Audit Firm" }
 ];
 
-// --- 2. SECURITY MIDDLEWARE ---
-// This function acts as a guard. It checks if the request has a valid token.
+// --- AUTH MIDDLEWARE (Same as before) ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
-
-    if (token == null) return res.status(401).json({ error: "Access Denied: No Token" });
-
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token == null) return res.status(401).json({ error: "Access Denied" });
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: "Access Denied: Invalid Token" });
-        req.user = user; // Save the user info (username, role) into the request
+        if (err) return res.status(403).json({ error: "Invalid Token" });
+        req.user = user;
         next();
     });
 };
 
-// --- 3. FILE STORAGE CONFIG ---
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const uploadDir = './uploads';
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        // We will rename this properly inside the route
-        cb(null, file.originalname); 
-    }
-});
-const upload = multer({ storage: storage });
+// --- HELPER: ENCRYPT FILE ---
+function encryptFile(buffer) {
+    const iv = crypto.randomBytes(16); // Generate random Initialization Vector
+    const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+    const result = Buffer.concat([iv, cipher.update(buffer), cipher.final()]);
+    return result;
+}
 
-// --- 4. BLOCKCHAIN CONNECTION ---
+// --- HELPER: DECRYPT FILE ---
+function decryptFile(buffer) {
+    const iv = buffer.slice(0, 16); // Extract the IV from the beginning
+    const encryptedText = buffer.slice(16);
+    const decipher = crypto.createDecipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+    const result = Buffer.concat([decipher.update(encryptedText), decipher.final()]);
+    return result;
+}
+
+// --- MULTER CONFIG (Memory Storage) ---
+// CRITICAL CHANGE: We switch from 'diskStorage' to 'memoryStorage'.
+// We need the file in RAM first so we can encrypt it BEFORE saving to disk.
+const upload = multer({ storage: multer.memoryStorage() });
+
+// --- BLOCKCHAIN CONNECTION (Same as before) ---
 async function connectToNetwork() {
     const walletPath = path.join(process.cwd(), 'wallet');
     const wallet = await Wallets.newFileSystemWallet(walletPath);
-    
     const ccpPath = path.resolve(__dirname, 'connection-org1.json');
     const ccp = JSON.parse(fs.readFileSync(ccpPath, 'utf8'));
-
     const gateway = new Gateway();
-    await gateway.connect(ccp, {
-        wallet,
-        identity: 'appUser', // We use one Fabric identity for the prototype
-        discovery: { enabled: true, asLocalhost: true }
-    });
-
+    await gateway.connect(ccp, { wallet, identity: 'appUser', discovery: { enabled: true, asLocalhost: true } });
     const network = await gateway.getNetwork('auditing-channel');
     const contract = network.getContract('audit-cc');
-
     return { gateway, contract };
 }
 
-// --- 5. API ROUTES ---
+// --- API ROUTES ---
 
-// LOGIN ROUTE (Public - No Token Needed)
+// 1. LOGIN
 app.post('/api/login', (req, res) => {
     const { username, password } = req.body;
-    
-    // Find user in mock DB
     const user = USERS.find(u => u.username === username && u.password === password);
-    
     if (user) {
-        // Generate Token
         const token = jwt.sign({ username: user.username, role: user.role }, process.env.JWT_SECRET);
         res.json({ token, role: user.role, name: user.name });
     } else {
@@ -88,25 +84,27 @@ app.post('/api/login', (req, res) => {
     }
 });
 
-// SUBMIT REPORT (Protected: Only logged in users)
+// 2. SUBMIT REPORT (With Encryption)
 app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res) => {
-    if (req.user.role !== 'SME') {
-        return res.status(403).json({ error: "Only SMEs can submit reports" });
-    }
+    if (req.user.role !== 'SME') return res.status(403).json({ error: "Unauthorized" });
 
     try {
         const { reportId, companyId, reportHash, period } = req.body;
 
-        // Rename uploaded file
+        // --- ENCRYPTION STEP ---
         if (req.file) {
-            const oldPath = req.file.path;
-            const newPath = path.join('uploads', reportId); 
-            fs.renameSync(oldPath, newPath);
+            const encryptedBuffer = encryptFile(req.file.buffer); // Encrypt the file in RAM
+            const savePath = path.join('uploads', reportId);
+            
+            // Create uploads folder if not exists
+            if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+            
+            // Save the ENCRYPTED file to disk
+            fs.writeFileSync(savePath, encryptedBuffer);
         }
 
         const { gateway, contract } = await connectToNetwork();
-        
-        console.log(`User ${req.user.username} is submitting report ${reportId}`);
+        console.log(`User ${req.user.username} submitted encrypted report ${reportId}`);
         await contract.submitTransaction('CreateAuditRecord', reportId, companyId, reportHash, period);
         await gateway.disconnect();
 
@@ -117,9 +115,8 @@ app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res
     }
 });
 
-// GET ALL AUDITS (Protected)
+// 3. GET AUDITS
 app.get('/api/audits', authenticateToken, async (req, res) => {
-    // Both SMEs and Auditors can see this, but you could restrict it if needed
     try {
         const { gateway, contract } = await connectToNetwork();
         const result = await contract.evaluateTransaction('GetAllAudits');
@@ -130,12 +127,9 @@ app.get('/api/audits', authenticateToken, async (req, res) => {
     }
 });
 
-// UPDATE STATUS (Protected: Only Auditors)
+// 4. UPDATE STATUS
 app.put('/api/audit/:id/status', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'AUDITOR') {
-        return res.status(403).json({ error: "Only Auditors can approve/reject" });
-    }
-
+    if (req.user.role !== 'AUDITOR') return res.status(403).json({ error: "Unauthorized" });
     try {
         const { status } = req.body;
         const reportId = req.params.id;
@@ -148,15 +142,41 @@ app.put('/api/audit/:id/status', authenticateToken, async (req, res) => {
     }
 });
 
-// DOWNLOAD FILE (Protected)
+// 5. DOWNLOAD FILE (With Decryption)
 app.get('/api/audit/:id/download', authenticateToken, (req, res) => {
     const reportId = req.params.id;
     const filePath = path.join(__dirname, 'uploads', reportId);
 
     if (fs.existsSync(filePath)) {
-        res.download(filePath, `Financial_Report_${reportId}.xlsx`);
+        try {
+            // Read encrypted file from disk
+            const encryptedFile = fs.readFileSync(filePath);
+            
+            // --- DECRYPTION STEP ---
+            const decryptedBuffer = decryptFile(encryptedFile);
+            
+            // Send decrypted file to user
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.send(decryptedBuffer);
+        } catch (err) {
+            console.error("Decryption failed:", err);
+            res.status(500).json({ error: "Failed to decrypt file." });
+        }
     } else {
         res.status(404).json({ error: "File not found." });
+    }
+});
+
+// 6. HISTORY
+app.get('/api/audit/:id/history', authenticateToken, async (req, res) => {
+    try {
+        const reportId = req.params.id;
+        const { gateway, contract } = await connectToNetwork();
+        const result = await contract.evaluateTransaction('GetAuditHistory', reportId);
+        await gateway.disconnect();
+        res.status(200).json(JSON.parse(result.toString()));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
