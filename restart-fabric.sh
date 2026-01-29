@@ -20,7 +20,7 @@ echo "🛑 Taking down the old network..."
 ./network.sh down
 
 echo "🏗️  Starting new network and channel 'auditing-channel'..."
-./network.sh up createChannel -c auditing-channel -ca
+./network.sh up createChannel -c auditing-channel -ca -s couchdb
 
 # --- STEP 4: Deploy Chaincode ---
 echo "⛓️  Deploying 'audit-cc' chaincode..."
