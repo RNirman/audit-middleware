@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# --- STEP 0: Ensure MongoDB is running ---
+echo "🍃 Checking MongoDB..."
+if [ ! "$(docker ps -q -f name=mongodb)" ]; then
+    if [ "$(docker ps -aq -f name=mongodb)" ]; then
+        echo "   Restarting existing MongoDB..."
+        docker start mongodb
+    else
+        echo "   Starting new MongoDB with persistent volume..."
+        docker run -d -p 27017:27017 --name mongodb -v mongo_data:/data/db mongo:latest
+    fi
+else
+    echo "   MongoDB is already running."
+fi
+
 # --- STEP 1: Fix Windows Networking (WSL2 Bug) ---
 echo "🔧 Requesting Windows Admin access to reset Network (Fixing 'winnat')..."
 echo "👉 Click 'Yes' on the popup window..."

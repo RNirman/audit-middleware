@@ -18,6 +18,7 @@
     "fabric-ca-client": "^2.2.20",
     "fabric-network": "^2.2.20",
     "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.1.5",
     "multer": "^2.0.2"
   }
 }
