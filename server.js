@@ -28,6 +28,7 @@ const initDB = async () => {
         if (count === 0) {
             console.log("⚠️ No users found. Seeding database...");
             await User.create([
+                { username: "admin", password: "admin123", role: "ADMIN", name: "System Administrator" },
                 { username: "sme01", password: "123", role: "SME", name: "Alpha Industries", companyId: "SME_ALPHA" },
                 { username: "auditor01", password: "123", role: "AUDITOR", name: "Big 4 Audit Firm" }
             ]);
@@ -113,14 +114,19 @@ app.post('/api/login', async (req, res) => {
 
 // 2. SUBMIT REPORT (Unchanged logic, just ensure imports match)
 app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res) => {
-    // 1. Check Role
     if (req.user.role !== 'SME') return res.status(403).json({ error: "Unauthorized" });
-
+    
     try {
-        const { reportId, companyId, department, reportHash, period } = req.body;
+        const { reportId, department, period } = req.body;
 
-        // 2. Combine the data for the blockchain
-        const combinedInfo = `${period} | ${department}`;
+        // SECURITY FIX: Ignore the 'companyId' sent from frontend.
+        // Instead, look up the REAL companyId from the database using the logged-in user.
+        const user = await User.findOne({ username: req.user.username });
+        const companyId = user.companyId; // <--- The Source of Truth
+
+        if (!companyId) {
+            return res.status(400).json({ error: "User has no Company ID assigned." });
+        }
 
         // 3. Handle File Upload (Encryption)
         if (req.file) {
@@ -135,7 +141,7 @@ app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res
         console.log(`User ${req.user.username} submitted report ${reportId}`);
 
         await contract.submitTransaction('CreateAuditRecord', reportId, companyId, department, reportHash, period);
-        
+
         await gateway.disconnect();
 
         res.status(200).json({ message: 'Success', reportId });
@@ -149,9 +155,22 @@ app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res
 app.get('/api/audits', authenticateToken, async (req, res) => {
     try {
         const { gateway, contract } = await connectToNetwork();
-        const result = await contract.evaluateTransaction('GetAllAudits');
+        const resultBuffer = await contract.evaluateTransaction('GetAllAudits');
+        const allAudits = JSON.parse(resultBuffer.toString());
         await gateway.disconnect();
-        res.status(200).json(JSON.parse(result.toString()));
+
+        // FILTERING LOGIC
+        if (req.user.role === 'SME') {
+            // SME only sees their own Company's reports
+            // We need to look up the SME's CompanyID from the User DB first
+            const user = await User.findOne({ username: req.user.username });
+            const myAudits = allAudits.filter(a => a.companyId === user.companyId);
+            return res.json(myAudits);
+        }
+
+        // Auditors/Admins see EVERYTHING
+        res.json(allAudits);
+
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -207,4 +226,53 @@ app.get('/api/audit/:id/history', authenticateToken, async (req, res) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+});
+
+// 7. CREATE NEW USER (Protected: Only ADMIN can call this)
+app.post('/api/users', authenticateToken, async (req, res) => {
+    // Security Check: Is the requester an Admin?
+    if (req.user.role !== 'ADMIN') {
+        return res.status(403).json({ error: "Access Denied: Admin only." });
+    }
+
+    try {
+        const { username, password, role, name, companyId } = req.body;
+
+        // Check if user already exists
+        const existing = await User.findOne({ username });
+        if (existing) return res.status(400).json({ error: "Username already exists" });
+
+        // Create user
+        await User.create({ username, password, role, name, companyId });
+
+        console.log(`Admin ${req.user.username} created new user: ${username}`);
+        res.status(201).json({ message: "User created successfully" });
+    } catch (error) {
+        res.status(500).json({ error: "Error creating user" });
+    }
+});
+
+// 8. GET ALL USERS (Admin Only)
+app.get('/api/users', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: "Admin only" });
+
+    try {
+        // Return users but HIDE passwords!
+        const users = await User.find({}, '-password');
+        res.json(users);
+    } catch (error) {
+        res.status(500).json({ error: "Failed to fetch users" });
+    }
+});
+
+// 9. DELETE USER (Admin Only)
+app.delete('/api/users/:username', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'ADMIN') return res.status(403).json({ error: "Admin only" });
+
+    try {
+        await User.deleteOne({ username: req.params.username });
+        res.json({ message: "User deleted" });
+    } catch (error) {
+        res.status(500).json({ error: "Delete failed" });
+    }
 });
