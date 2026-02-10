@@ -103,7 +103,7 @@ app.post('/api/login', async (req, res) => {
                 companyId: user.companyId
             }, process.env.JWT_SECRET);
 
-            res.json({ token, role: user.role, name: user.name });
+            res.json({ token, role: user.role, name: user.name, companyId: user.companyId });
         } else {
             res.status(401).json({ error: "Invalid credentials" });
         }
@@ -117,12 +117,14 @@ app.post('/api/audit', authenticateToken, upload.single('file'), async (req, res
     if (req.user.role !== 'SME') return res.status(403).json({ error: "Unauthorized" });
     
     try {
-        const { reportId, department, period } = req.body;
+        const { reportId, department, period, reportHash } = req.body;
 
         // SECURITY FIX: Ignore the 'companyId' sent from frontend.
         // Instead, look up the REAL companyId from the database using the logged-in user.
         const user = await User.findOne({ username: req.user.username });
         const companyId = user.companyId; // <--- The Source of Truth
+
+        console.log(user);
 
         if (!companyId) {
             return res.status(400).json({ error: "User has no Company ID assigned." });
